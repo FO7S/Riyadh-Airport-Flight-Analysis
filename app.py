@@ -255,11 +255,11 @@ def preprocess_data(df):
         if col in df.columns:
             df[col] = df[col].fillna(value)
 
-    # Drop rows with missing terminal values because the ratio is very small
+    # Drop rows with missing terminal values
     if "movement.terminal" in df.columns:
         df = df.dropna(subset=["movement.terminal"])
 
-    # Drop rows with missing destination airport name, because it is needed for route classification
+    # Drop rows with missing destination airport name
     if "destination_airport_name" in df.columns:
         df = df.dropna(subset=["destination_airport_name"])
 
@@ -314,6 +314,47 @@ def daily_series(df):
     )
     d["7-Day Rolling Average"] = d["Number of Flights"].rolling(7).mean()
     return d
+
+
+@st.cache_data(show_spinner=False)
+def get_column_dictionary(df):
+    descriptions = {
+        "flight_number": "Unique identifier assigned to each flight departure record.",
+        "airline.name": "Name of the airline operating the departure flight.",
+        "airline.iata": "IATA airline code.",
+        "airline.icao": "ICAO airline code.",
+        "flight_type": "Flight classification provided in the source dataset.",
+        "isCargo": "Indicates whether the flight is a cargo flight.",
+        "origin_airport_name": "Name of the origin airport.",
+        "origin_airport_icao": "ICAO code of the origin airport.",
+        "origin_airport_iata": "IATA code of the origin airport.",
+        "destination_airport_name": "Name of the destination airport.",
+        "destination_airport_icao": "ICAO code of the destination airport.",
+        "destination_airport_iata": "IATA code of the destination airport.",
+        "movement.terminal": "Airport terminal associated with the departure flight.",
+        "movement.quality": "Quality or reliability indicator of the movement record.",
+        "movement.scheduledTime.utc": "Scheduled departure time in UTC.",
+        "movement.scheduledTime.local": "Scheduled departure time in local Riyadh time.",
+        "date": "Calendar date extracted from the scheduled local departure time.",
+        "year": "Year extracted from the scheduled local departure time.",
+        "month": "Month number extracted from the scheduled local departure time.",
+        "month_name": "Month name extracted from the scheduled local departure time.",
+        "day": "Day of month extracted from the scheduled local departure time.",
+        "day_of_week": "Weekday name extracted from the scheduled local departure time.",
+        "hour": "Hour of day extracted from the scheduled local departure time.",
+        "destination_airport_name_clean": "Cleaned destination airport name used for route classification.",
+        "route_type": "Derived route type classified as Domestic or International based on destination airport name."
+    }
+
+    rows = []
+    for col in df.columns:
+        rows.append([
+            col,
+            str(df[col].dtype),
+            descriptions.get(col, "No description added yet.")
+        ])
+
+    return pd.DataFrame(rows, columns=["Column Name", "Data Type", "Description"])
 
 
 @st.cache_data(show_spinner=False)
@@ -421,6 +462,7 @@ def run_forecasting(daily_df):
 try:
     raw_df = load_data()
     df = preprocess_data(raw_df)
+    column_dictionary_df = get_column_dictionary(df)
 except Exception as e:
     st.error(f"Error loading dataset: {e}")
     st.stop()
@@ -625,8 +667,8 @@ daily_df = daily_series(filtered)
 # =========================================================
 # TABS
 # =========================================================
-tab1, tab2, tab3, tab4, tab5 = st.tabs(
-    ["Overview", "Traffic Patterns", "Destinations", "Forecasting", "Insights"]
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+    ["Overview", "Traffic Patterns", "Destinations", "Forecasting", "Insights", "Data Overview"]
 )
 
 
@@ -1044,6 +1086,29 @@ with tab5:
                 f"The dashboard records <b>{int(route_counts['Domestic']):,}</b> domestic departures in the filtered view."
             )
 
+    st.markdown('<div class="section-head">Extended Business Insights</div>', unsafe_allow_html=True)
+
+    st.markdown("""
+    <div class="glass">
+    The exploratory analysis revealed several important operational patterns:
+    <br><br>
+    <b>• Stable flight activity:</b><br>
+    Daily flight counts fluctuate, but overall they remain within a relatively consistent range, indicating stable airport operations.
+    <br><br>
+    <b>• Regional connectivity dominance:</b><br>
+    Many international routes connect Riyadh with nearby regional hubs such as <b>Dubai, Cairo, and Istanbul</b>, highlighting the strong importance of regional travel demand.
+    <br><br>
+    <b>• Airline activity concentration:</b><br>
+    A small number of airlines account for a large share of departures, which is typical for major hub airports where traffic is concentrated among key carriers.
+    <br><br>
+    <b>• Terminal utilization imbalance:</b><br>
+    The analysis showed that <b>Terminal 5 handled the largest share of flights</b>, mainly because it served a substantial portion of domestic routes. This created higher operational pressure compared with other terminals.
+    <br><br>
+    <b>• Major operational adjustment:</b><br>
+    A notable operational change occurred on <b>February 25, 2026</b>, when domestic flights were redistributed to <b>Terminals 3 and 4</b> at Riyadh Airport. This real-world adjustment illustrates how airport data analysis can support <b>data-driven operational decisions</b> that improve passenger flow and reduce congestion.
+    </div>
+    """, unsafe_allow_html=True)
+
     st.markdown('<div class="section-head">Download Filtered Data</div>', unsafe_allow_html=True)
     csv_data = filtered.to_csv(index=False).encode("utf-8")
     st.download_button(
@@ -1061,6 +1126,58 @@ with tab5:
     and reviewing short-term flight forecasting in a professional and portfolio-ready format.
     </div>
     """, unsafe_allow_html=True)
+
+
+# =========================================================
+# TAB 6 DATA OVERVIEW
+# =========================================================
+with tab6:
+    st.markdown('<div class="section-head">Processed Dataset Overview</div>', unsafe_allow_html=True)
+
+    st.markdown("""
+    <div class="glass">
+    This tab presents the dataset after preprocessing.
+    The preprocessing workflow included:
+    <br><br>
+    • converting local and UTC time columns into datetime format  
+    • removing highly incomplete or less useful columns  
+    • filling selected missing categorical values  
+    • dropping rows with missing terminal or destination names  
+    • creating time-based features such as year, month, weekday, and hour  
+    • deriving a route type label (Domestic / International) based on destination airport name
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown('<div class="section-head">Dataset Summary</div>', unsafe_allow_html=True)
+    d1, d2, d3 = st.columns(3)
+    with d1:
+        kpi_card("Rows", fmt_num(df.shape[0]), "After preprocessing")
+    with d2:
+        kpi_card("Columns", fmt_num(df.shape[1]), "Available fields")
+    with d3:
+        kpi_card("Missing Values", fmt_num(df.isna().sum().sum()), "Across processed dataset")
+
+    st.markdown('<div class="section-head">Processed Data Table</div>', unsafe_allow_html=True)
+    rows_to_show = st.slider(
+        "Select number of rows to display",
+        min_value=50,
+        max_value=min(5000, len(df)),
+        value=min(200, len(df)),
+        step=50
+    )
+    st.dataframe(df.head(rows_to_show), use_container_width=True, hide_index=True)
+
+    st.markdown('<div class="section-head">Column Dictionary</div>', unsafe_allow_html=True)
+    st.dataframe(column_dictionary_df, use_container_width=True, hide_index=True)
+
+    st.markdown('<div class="section-head">Data Types and Missing Values</div>', unsafe_allow_html=True)
+    dtype_df = pd.DataFrame({
+        "Column Name": df.columns,
+        "Data Type": df.dtypes.astype(str).values,
+        "Missing Values": df.isna().sum().values,
+        "Unique Values": [df[col].nunique(dropna=True) for col in df.columns]
+    })
+    st.dataframe(dtype_df, use_container_width=True, hide_index=True)
 
 
 st.markdown("---")
