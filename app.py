@@ -967,7 +967,7 @@ with tab3:
         )
 
         fig_map.update_traces(
-            marker=dict(opacity=0.82, line=dict(width=1.2, color="white"))
+            marker=dict(opacity=0.82)
         )
 
         fig_map.update_layout(
