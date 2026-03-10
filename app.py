@@ -205,11 +205,6 @@ def load_data():
 def preprocess_data(df):
     df = df.copy()
 
-    # =========================
-    # Data Preprocessing
-    # =========================
-
-    # Convert time columns to datetime format
     df["movement.scheduledTime.local"] = pd.to_datetime(
         df["movement.scheduledTime.local"], errors="coerce"
     )
@@ -218,7 +213,6 @@ def preprocess_data(df):
         df["movement.scheduledTime.utc"], errors="coerce"
     )
 
-    # Remove timezone if present
     try:
         if getattr(df["movement.scheduledTime.local"].dt, "tz", None) is not None:
             df["movement.scheduledTime.local"] = df["movement.scheduledTime.local"].dt.tz_localize(None)
@@ -231,7 +225,6 @@ def preprocess_data(df):
     except Exception:
         pass
 
-    # Remove columns that are either highly incomplete or not useful for this analysis
     cols_to_drop = [
         "aircraft.reg",
         "aircraft.modeS",
@@ -244,7 +237,6 @@ def preprocess_data(df):
     existing_drop_cols = [col for col in cols_to_drop if col in df.columns]
     df = df.drop(columns=existing_drop_cols)
 
-    # Fill missing values in important categorical columns
     fill_map = {
         "destination_airport_iata": "Unknown",
         "destination_airport_icao": "Unknown",
@@ -255,18 +247,14 @@ def preprocess_data(df):
         if col in df.columns:
             df[col] = df[col].fillna(value)
 
-    # Drop rows with missing terminal values
     if "movement.terminal" in df.columns:
         df = df.dropna(subset=["movement.terminal"])
 
-    # Drop rows with missing destination airport name
     if "destination_airport_name" in df.columns:
         df = df.dropna(subset=["destination_airport_name"])
 
-    # Remove rows with invalid local datetime
     df = df.dropna(subset=["movement.scheduledTime.local"]).copy()
 
-    # Create useful time-based features for analysis
     df["date"] = df["movement.scheduledTime.local"].dt.floor("D")
     df["year"] = df["movement.scheduledTime.local"].dt.year
     df["month"] = df["movement.scheduledTime.local"].dt.month
@@ -275,7 +263,6 @@ def preprocess_data(df):
     df["day_of_week"] = df["movement.scheduledTime.local"].dt.day_name()
     df["hour"] = df["movement.scheduledTime.local"].dt.hour
 
-    # Define Saudi domestic destinations
     saudi_cities = {
         "Abha", "Ad Dammam", "Al Qaysumah", "Al Ula", "Al-Ula", "Al-Bakha",
         "Al-Jawf", "Arar", "Bisha", "Burayda", "Dammam", "Dawadmi", "Gerayat",
@@ -284,22 +271,17 @@ def preprocess_data(df):
         "Turayf", "Vadi-ed-Davasir", "Yanbu"
     }
 
-    # Clean destination names before classification
     df["destination_airport_name_clean"] = (
         df["destination_airport_name"]
         .astype(str)
         .str.strip()
     )
 
-    # Classify each destination as Domestic or International
     df["route_type"] = df["destination_airport_name_clean"].apply(
         lambda x: "Domestic" if x in saudi_cities else "International"
     )
 
-    # Sort the dataset chronologically
     df = df.sort_values("movement.scheduledTime.local")
-
-    # Reset index after preprocessing
     df = df.reset_index(drop=True)
 
     return df
@@ -366,7 +348,6 @@ def run_forecasting(daily_df):
 
     ts = daily_df.copy().sort_values("date").reset_index(drop=True)
 
-    # Remove suspicious incomplete final day if it is much lower than normal
     if len(ts) > 2 and ts.loc[len(ts) - 1, "Number of Flights"] < ts["Number of Flights"].median() * 0.65:
         ts = ts.iloc[:-1].copy().reset_index(drop=True)
 
@@ -381,12 +362,10 @@ def run_forecasting(daily_df):
 
     feature_cols = ["time_index", "day_of_week_num", "month_num", "is_weekend"]
 
-    # Linear Regression
     lr = LinearRegression()
     lr.fit(train[feature_cols], train["Number of Flights"])
     test["Linear Regression Prediction"] = lr.predict(test[feature_cols])
 
-    # SARIMAX
     fitted_model = None
     if SARIMAX_AVAILABLE and len(train) >= 20:
         try:
@@ -416,7 +395,6 @@ def run_forecasting(daily_df):
 
     results_df = pd.DataFrame(rows, columns=["Model", "MAE", "RMSE"])
 
-    # Future 14 days
     future_days = 14
     last_date = ts["date"].max()
     future_dates = pd.date_range(last_date + pd.Timedelta(days=1), periods=future_days, freq="D")
@@ -902,6 +880,37 @@ with tab3:
         )
         fig_air.update_traces(textposition="outside")
         st.plotly_chart(fig_air, use_container_width=True)
+
+    if "movement.terminal" in filtered.columns:
+        st.markdown('<div class="section-head">Flight Distribution by Terminal</div>', unsafe_allow_html=True)
+
+        terminal_df = (
+            filtered.groupby("movement.terminal")
+            .size()
+            .reset_index(name="Number of Flights")
+            .sort_values("Number of Flights", ascending=False)
+        )
+
+        terminal_df = terminal_df.rename(columns={"movement.terminal": "Terminal"})
+
+        fig_terminal = px.bar(
+            terminal_df,
+            x="Terminal",
+            y="Number of Flights",
+            text="Number of Flights"
+        )
+
+        fig_terminal.update_layout(
+            height=420,
+            margin=dict(l=10, r=10, t=25, b=10),
+            xaxis_title="Airport Terminal",
+            yaxis_title="Number of Flights",
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)"
+        )
+
+        fig_terminal.update_traces(textposition="outside")
+        st.plotly_chart(fig_terminal, use_container_width=True)
 
 
 # =========================================================
