@@ -190,6 +190,96 @@ def insight_box(title, text):
     )
 
 
+def build_destination_map_data(filtered_df):
+    airport_coords = {
+        "Riyadh": (24.7136, 46.6753),
+        "Jeddah": (21.5433, 39.1728),
+        "Dammam": (26.4207, 50.0888),
+        "Medina": (24.5247, 39.5692),
+        "Abha": (18.2164, 42.5053),
+        "Tabuk": (28.3838, 36.5662),
+        "Taif": (21.2703, 40.4158),
+        "Jazan": (16.8892, 42.5511),
+        "Yanbu": (24.0895, 38.0618),
+        "Al Ula": (26.6084, 37.9230),
+        "Neom Bay Airport": (28.8337, 34.7871),
+        "Arar": (30.9753, 41.0381),
+        "Bisha": (19.9844, 42.6052),
+        "Rafha": (29.6264, 43.4906),
+        "Sharura": (17.4669, 47.1214),
+        "Najran": (17.5650, 44.2289),
+        "Hail": (27.5114, 41.7208),
+        "Qassim": (26.3028, 43.7744),
+        "Dubai": (25.2048, 55.2708),
+        "Cairo": (30.0444, 31.2357),
+        "Istanbul": (41.0082, 28.9784),
+        "Doha": (25.2854, 51.5310),
+        "Kuwait": (29.3759, 47.9774),
+        "Amman": (31.9539, 35.9106),
+        "Bahrain": (26.0667, 50.5577),
+        "Abu Dhabi": (24.4539, 54.3773),
+        "Sharjah": (25.3463, 55.4209),
+        "Muscat": (23.5880, 58.3829),
+        "Manama": (26.2235, 50.5876),
+        "Beirut": (33.8938, 35.5018),
+        "Baghdad": (33.3152, 44.3661),
+        "Alexandria": (31.2001, 29.9187),
+        "Sohag": (26.5560, 31.6948),
+        "Asmara": (15.3229, 38.9251),
+        "Khartoum": (15.5007, 32.5599),
+        "Addis Ababa": (8.9806, 38.7578),
+        "Mumbai": (19.0760, 72.8777),
+        "Delhi": (28.6139, 77.2090),
+        "Karachi": (24.8607, 67.0011),
+        "Lahore": (31.5204, 74.3587),
+        "London": (51.5072, -0.1276),
+        "Paris": (48.8566, 2.3522),
+        "Frankfurt": (50.1109, 8.6821),
+        "Rome": (41.9028, 12.4964),
+        "Vienna": (48.2082, 16.3738),
+        "Madrid": (40.4168, -3.7038),
+        "Athens": (37.9838, 23.7275),
+        "Tunis": (36.8065, 10.1815),
+        "Casablanca": (33.5731, -7.5898),
+        "New York": (40.7128, -74.0060),
+        "Washington": (38.9072, -77.0369),
+        "Toronto": (43.6532, -79.3832),
+        "Kuala Lumpur": (3.1390, 101.6869),
+        "Jakarta": (-6.2088, 106.8456),
+        "Singapore": (1.3521, 103.8198),
+        "Bangkok": (13.7563, 100.5018),
+        "Manila": (14.5995, 120.9842)
+    }
+
+    if "destination_airport_name" not in filtered_df.columns:
+        return pd.DataFrame()
+
+    map_df = (
+        filtered_df.groupby("destination_airport_name")
+        .size()
+        .reset_index(name="Number of Flights")
+        .rename(columns={"destination_airport_name": "Destination Airport"})
+    )
+
+    map_df["lat"] = map_df["Destination Airport"].map(lambda x: airport_coords.get(x, (None, None))[0])
+    map_df["lon"] = map_df["Destination Airport"].map(lambda x: airport_coords.get(x, (None, None))[1])
+    map_df = map_df.dropna(subset=["lat", "lon"]).copy()
+
+    origin_df = pd.DataFrame({
+        "Destination Airport": ["Riyadh"],
+        "Number of Flights": [map_df["Number of Flights"].sum() if not map_df.empty else 0],
+        "lat": [24.7136],
+        "lon": [46.6753],
+        "kind": ["origin"]
+    })
+
+    if not map_df.empty:
+        map_df["kind"] = "destination"
+
+    final_map_df = pd.concat([map_df, origin_df], ignore_index=True)
+    return final_map_df
+
+
 # =========================================================
 # LOAD DATA
 # =========================================================
@@ -232,7 +322,8 @@ def preprocess_data(df):
         "movement.airport.timeZone",
         "status",
         "aircraft.model",
-        "codeshareStatus"
+        "codeshareStatus",
+        "isCargo"
     ]
     existing_drop_cols = [col for col in cols_to_drop if col in df.columns]
     df = df.drop(columns=existing_drop_cols)
@@ -306,7 +397,6 @@ def get_column_dictionary(df):
         "airline.iata": "IATA airline code.",
         "airline.icao": "ICAO airline code.",
         "flight_type": "Flight classification provided in the source dataset.",
-        "isCargo": "Indicates whether the flight is a cargo flight.",
         "origin_airport_name": "Name of the origin airport.",
         "origin_airport_icao": "ICAO code of the origin airport.",
         "origin_airport_iata": "IATA code of the origin airport.",
@@ -852,6 +942,53 @@ with tab3:
                 st.markdown('<div class="section-head">Top 10 Domestic Destinations from Riyadh</div>', unsafe_allow_html=True)
                 st.info("No domestic destination data is available for the selected filters.")
 
+    st.markdown('<div class="section-head">Geographic Destination Heatmap</div>', unsafe_allow_html=True)
+
+    map_df = build_destination_map_data(filtered)
+
+    if not map_df.empty:
+        fig_map = px.scatter_mapbox(
+            map_df,
+            lat="lat",
+            lon="lon",
+            size="Number of Flights",
+            color="kind",
+            hover_name="Destination Airport",
+            hover_data={
+                "lat": False,
+                "lon": False,
+                "Number of Flights": True,
+                "kind": True
+            },
+            zoom=3.2,
+            height=620,
+            size_max=38,
+            mapbox_style="carto-darkmatter"
+        )
+
+        fig_map.update_traces(
+            marker=dict(opacity=0.82, line=dict(width=1.2, color="white"))
+        )
+
+        fig_map.update_layout(
+            margin=dict(l=10, r=10, t=20, b=10),
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            legend_title_text="Location Type"
+        )
+
+        st.plotly_chart(fig_map, use_container_width=True)
+
+        st.markdown("""
+        <div class="glass">
+        This geographic view highlights Riyadh as the central origin point and displays destination airports
+        according to their flight volume. Larger circles indicate higher traffic concentration, helping users
+        quickly identify the strongest regional and international connections.
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        st.info("No mapped destination coordinates are currently available for the selected filters.")
+
     st.markdown('<div class="section-head">Top Airlines by Number of Flights</div>', unsafe_allow_html=True)
 
     if "airline.name" in filtered.columns:
@@ -1153,7 +1290,8 @@ with tab6:
     • filling selected missing categorical values  
     • dropping rows with missing terminal or destination names  
     • creating time-based features such as year, month, weekday, and hour  
-    • deriving a route type label (Domestic / International) based on destination airport name
+    • deriving a route type label (Domestic / International) based on destination airport name  
+    • removing the <b>isCargo</b> column because it was not required for the final dashboard analysis
     </div>
     """, unsafe_allow_html=True)
 
