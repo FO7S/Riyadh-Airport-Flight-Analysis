@@ -6,14 +6,21 @@ import pandas as pd
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
+
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 try:
-    from statsmodels.tsa.statespace.sarimax import SARIMAX
-    SARIMAX_AVAILABLE = True
+    from statsmodels.tsa.arima.model import ARIMA
+    ARIMA_AVAILABLE = True
 except Exception:
-    SARIMAX_AVAILABLE = False
+    ARIMA_AVAILABLE = False
+
+try:
+    from prophet import Prophet
+    PROPHET_AVAILABLE = True
+except Exception:
+    PROPHET_AVAILABLE = False
 
 
 # =========================================================
@@ -139,6 +146,15 @@ st.markdown("""
         color: #94a3b8;
         font-size: 0.86rem;
     }
+
+    .subtle-note {
+        background: rgba(56,189,248,0.08);
+        border: 1px solid rgba(56,189,248,0.18);
+        border-radius: 14px;
+        padding: 0.75rem 0.95rem;
+        color: #dbeafe;
+        margin-top: 0.6rem;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -155,7 +171,10 @@ DATA_URL = "https://media.githubusercontent.com/media/FO7S/Riyadh-Airport-Flight
 def fmt_num(x):
     if pd.isna(x):
         return "-"
-    return f"{int(x):,}"
+    try:
+        return f"{int(x):,}"
+    except Exception:
+        return str(x)
 
 
 def mode_safe(series):
@@ -190,11 +209,24 @@ def insight_box(title, text):
     )
 
 
+def safe_pct(part, total):
+    if total == 0:
+        return 0
+    return (part / total) * 100
+
+
+def add_headroom(max_value, ratio=0.12):
+    if pd.isna(max_value) or max_value == 0:
+        return 1
+    return max_value * (1 + ratio)
+
+
 def build_destination_map_data(filtered_df):
     airport_coords = {
         "Riyadh": (24.7136, 46.6753),
         "Jeddah": (21.5433, 39.1728),
         "Dammam": (26.4207, 50.0888),
+        "Ad Dammam": (26.4207, 50.0888),
         "Medina": (24.5247, 39.5692),
         "Abha": (18.2164, 42.5053),
         "Tabuk": (28.3838, 36.5662),
@@ -289,7 +321,7 @@ def load_data():
 
 
 # =========================================================
-# DATA PREPROCESSING
+# PREPROCESSING
 # =========================================================
 @st.cache_data(show_spinner=False)
 def preprocess_data(df):
@@ -298,7 +330,6 @@ def preprocess_data(df):
     df["movement.scheduledTime.local"] = pd.to_datetime(
         df["movement.scheduledTime.local"], errors="coerce"
     )
-
     df["movement.scheduledTime.utc"] = pd.to_datetime(
         df["movement.scheduledTime.utc"], errors="coerce"
     )
@@ -362,19 +393,13 @@ def preprocess_data(df):
         "Turayf", "Vadi-ed-Davasir", "Yanbu"
     }
 
-    df["destination_airport_name_clean"] = (
-        df["destination_airport_name"]
-        .astype(str)
-        .str.strip()
-    )
+    df["destination_airport_name_clean"] = df["destination_airport_name"].astype(str).str.strip()
 
     df["route_type"] = df["destination_airport_name_clean"].apply(
         lambda x: "Domestic" if x in saudi_cities else "International"
     )
 
-    df = df.sort_values("movement.scheduledTime.local")
-    df = df.reset_index(drop=True)
-
+    df = df.sort_values("movement.scheduledTime.local").reset_index(drop=True)
     return df
 
 
@@ -420,15 +445,38 @@ def get_column_dictionary(df):
 
     rows = []
     for col in df.columns:
-        rows.append([
-            col,
-            str(df[col].dtype),
-            descriptions.get(col, "No description added yet.")
-        ])
+        rows.append([col, str(df[col].dtype), descriptions.get(col, "No description added yet.")])
 
     return pd.DataFrame(rows, columns=["Column Name", "Data Type", "Description"])
 
 
+@st.cache_data(show_spinner=False)
+def get_quality_report(raw_df, processed_df):
+    missing_percentage = (raw_df.isnull().sum() / len(raw_df) * 100).sort_values(ascending=False).reset_index()
+    missing_percentage.columns = ["Column", "Missing %"]
+
+    missing_ratio = raw_df.isnull().mean()
+    cols_over_50 = missing_ratio[missing_ratio > 0.5].index.tolist()
+
+    text_columns = raw_df.select_dtypes(include=["object"]).columns.tolist()
+    datetime_like_columns = [col for col in raw_df.columns if "time" in col.lower() or "date" in col.lower()]
+
+    summary = {
+        "raw_rows": raw_df.shape[0],
+        "raw_cols": raw_df.shape[1],
+        "processed_rows": processed_df.shape[0],
+        "processed_cols": processed_df.shape[1],
+        "columns_over_50_missing": cols_over_50,
+        "text_columns": text_columns,
+        "datetime_like_columns": datetime_like_columns
+    }
+
+    return missing_percentage, summary
+
+
+# =========================================================
+# FORECASTING
+# =========================================================
 @st.cache_data(show_spinner=False)
 def run_forecasting(daily_df):
     result = {"ready": False}
@@ -437,80 +485,113 @@ def run_forecasting(daily_df):
         return result
 
     ts = daily_df.copy().sort_values("date").reset_index(drop=True)
+    ts = ts.rename(columns={"Number of Flights": "flights"})
 
-    if len(ts) > 2 and ts.loc[len(ts) - 1, "Number of Flights"] < ts["Number of Flights"].median() * 0.65:
+    if len(ts) > 2 and ts.loc[len(ts) - 1, "flights"] < ts["flights"].median() * 0.65:
         ts = ts.iloc[:-1].copy().reset_index(drop=True)
-
-    ts["time_index"] = np.arange(len(ts))
-    ts["day_of_week_num"] = ts["date"].dt.dayofweek
-    ts["month_num"] = ts["date"].dt.month
-    ts["is_weekend"] = ts["day_of_week_num"].isin([4, 5]).astype(int)
 
     split_idx = int(len(ts) * 0.8)
     train = ts.iloc[:split_idx].copy()
     test = ts.iloc[split_idx:].copy()
 
-    feature_cols = ["time_index", "day_of_week_num", "month_num", "is_weekend"]
+    # Linear Regression
+    train_lr = train.copy()
+    test_lr = test.copy()
 
-    lr = LinearRegression()
-    lr.fit(train[feature_cols], train["Number of Flights"])
-    test["Linear Regression Prediction"] = lr.predict(test[feature_cols])
+    train_lr["time_index"] = range(len(train_lr))
+    test_lr["time_index"] = range(len(train_lr), len(train_lr) + len(test_lr))
 
-    fitted_model = None
-    if SARIMAX_AVAILABLE and len(train) >= 20:
+    lr_model = LinearRegression()
+    lr_model.fit(train_lr[["time_index"]], train_lr["flights"])
+    test["Linear Regression"] = lr_model.predict(test_lr[["time_index"]])
+
+    # ARIMA
+    if ARIMA_AVAILABLE:
         try:
-            model = SARIMAX(
-                train["Number of Flights"],
-                order=(1, 1, 1),
-                seasonal_order=(1, 1, 1, 7),
-                enforce_stationarity=False,
-                enforce_invertibility=False
-            )
-            fitted_model = model.fit(disp=False)
-            test["SARIMAX Prediction"] = fitted_model.forecast(steps=len(test)).values
+            arima_model = ARIMA(train["flights"], order=(5, 1, 0))
+            arima_fitted = arima_model.fit()
+            test["ARIMA"] = arima_fitted.forecast(steps=len(test)).values
         except Exception:
-            test["SARIMAX Prediction"] = np.nan
+            test["ARIMA"] = np.nan
     else:
-        test["SARIMAX Prediction"] = np.nan
+        test["ARIMA"] = np.nan
 
-    rows = []
-    for model_name, col in [
-        ("Linear Regression", "Linear Regression Prediction"),
-        ("SARIMAX", "SARIMAX Prediction")
-    ]:
-        if test[col].notna().sum() > 0:
-            mae = mean_absolute_error(test["Number of Flights"], test[col])
-            rmse = np.sqrt(mean_squared_error(test["Number of Flights"], test[col]))
-            rows.append([model_name, mae, rmse])
+    # Prophet
+    if PROPHET_AVAILABLE:
+        try:
+            prophet_train = train[["date", "flights"]].rename(columns={"date": "ds", "flights": "y"}).copy()
+            prophet_train["ds"] = pd.to_datetime(prophet_train["ds"]).dt.tz_localize(None)
 
-    results_df = pd.DataFrame(rows, columns=["Model", "MAE", "RMSE"])
+            prophet_model = Prophet(
+                daily_seasonality=False,
+                weekly_seasonality=True,
+                yearly_seasonality=False
+            )
+            prophet_model.fit(prophet_train)
 
+            future_prophet_test = pd.DataFrame({"ds": pd.to_datetime(test["date"]).dt.tz_localize(None)})
+            prophet_pred_test = prophet_model.predict(future_prophet_test)
+            test["Prophet"] = prophet_pred_test["yhat"].values
+        except Exception:
+            test["Prophet"] = np.nan
+    else:
+        test["Prophet"] = np.nan
+
+    metrics_rows = []
+    for model_name in ["Linear Regression", "ARIMA", "Prophet"]:
+        if model_name in test.columns and test[model_name].notna().sum() > 0:
+            mae = mean_absolute_error(test["flights"], test[model_name])
+            rmse = np.sqrt(mean_squared_error(test["flights"], test[model_name]))
+            metrics_rows.append([model_name, mae, rmse])
+
+    results_df = pd.DataFrame(metrics_rows, columns=["Model", "MAE", "RMSE"]).sort_values("RMSE")
+
+    # Future 14-day forecast
     future_days = 14
     last_date = ts["date"].max()
     future_dates = pd.date_range(last_date + pd.Timedelta(days=1), periods=future_days, freq="D")
 
-    future_lr = pd.DataFrame({
-        "date": future_dates,
-        "time_index": np.arange(len(ts), len(ts) + future_days)
-    })
-    future_lr["day_of_week_num"] = future_lr["date"].dt.dayofweek
-    future_lr["month_num"] = future_lr["date"].dt.month
-    future_lr["is_weekend"] = future_lr["day_of_week_num"].isin([4, 5]).astype(int)
+    # LR future
+    future_lr = pd.DataFrame({"time_index": range(len(ts), len(ts) + future_days)})
+    lr_future_pred = lr_model.predict(future_lr[["time_index"]])
 
-    lr_future_pred = lr.predict(future_lr[feature_cols])
-
-    if fitted_model is not None:
+    # ARIMA future
+    if ARIMA_AVAILABLE and "ARIMA" in test.columns and test["ARIMA"].notna().sum() > 0:
         try:
-            sarimax_future_pred = fitted_model.forecast(steps=future_days).values
+            arima_model_full = ARIMA(ts["flights"], order=(5, 1, 0))
+            arima_full_fitted = arima_model_full.fit()
+            arima_future_pred = arima_full_fitted.forecast(steps=future_days).values
         except Exception:
-            sarimax_future_pred = [np.nan] * future_days
+            arima_future_pred = [np.nan] * future_days
     else:
-        sarimax_future_pred = [np.nan] * future_days
+        arima_future_pred = [np.nan] * future_days
+
+    # Prophet future
+    if PROPHET_AVAILABLE and "Prophet" in test.columns and test["Prophet"].notna().sum() > 0:
+        try:
+            prophet_full = ts[["date", "flights"]].rename(columns={"date": "ds", "flights": "y"}).copy()
+            prophet_full["ds"] = pd.to_datetime(prophet_full["ds"]).dt.tz_localize(None)
+
+            prophet_model_full = Prophet(
+                daily_seasonality=False,
+                weekly_seasonality=True,
+                yearly_seasonality=False
+            )
+            prophet_model_full.fit(prophet_full)
+
+            future_full = prophet_model_full.make_future_dataframe(periods=future_days)
+            future_pred = prophet_model_full.predict(future_full)
+            prophet_future_pred = future_pred.tail(future_days)["yhat"].values
+        except Exception:
+            prophet_future_pred = [np.nan] * future_days
+    else:
+        prophet_future_pred = [np.nan] * future_days
 
     future_df = pd.DataFrame({
         "Forecast Date": future_dates,
-        "Linear Regression Forecast": lr_future_pred,
-        "SARIMAX Forecast": sarimax_future_pred
+        "Linear Regression": lr_future_pred,
+        "ARIMA": arima_future_pred,
+        "Prophet": prophet_future_pred
     })
 
     result.update({
@@ -531,6 +612,7 @@ try:
     raw_df = load_data()
     df = preprocess_data(raw_df)
     column_dictionary_df = get_column_dictionary(df)
+    missing_percentage_df, quality_summary = get_quality_report(raw_df, df)
 except Exception as e:
     st.error(f"Error loading dataset: {e}")
     st.stop()
@@ -543,12 +625,13 @@ with st.sidebar:
     st.markdown("## Dataset Description")
     st.markdown("""
     This dashboard analyzes **Riyadh Airport departure flights** and includes:
-    - data preprocessing
-    - airline analysis
-    - destination analysis
-    - domestic and international route analysis
-    - traffic pattern exploration
+    - preprocessing and data overview
+    - airline and destination analysis
+    - domestic vs international route analysis
+    - time-based traffic patterns
+    - terminal utilization
     - short-term forecasting
+    - business insights
     """)
 
     st.markdown("---")
@@ -593,7 +676,19 @@ with st.sidebar:
     else:
         airline_selected = None
 
+    route_options = sorted(df["route_type"].dropna().unique())
+    route_selected = st.multiselect(
+        "Select Route Type",
+        route_options,
+        default=route_options
+    )
+
     search_text = st.text_input("Search by Destination or Airline", "")
+
+    st.markdown("---")
+    st.markdown("## Model Availability")
+    st.markdown(f"- ARIMA: {'✅ Available' if ARIMA_AVAILABLE else '❌ Not installed'}")
+    st.markdown(f"- Prophet: {'✅ Available' if PROPHET_AVAILABLE else '❌ Not installed'}")
 
 
 # =========================================================
@@ -610,6 +705,9 @@ if "movement.terminal" in df.columns and terminal_selected:
 
 if "airline.name" in df.columns and airline_selected:
     mask &= df["airline.name"].astype(str).isin(airline_selected)
+
+if "route_type" in df.columns and route_selected:
+    mask &= df["route_type"].isin(route_selected)
 
 filtered = df.loc[mask].copy()
 
@@ -638,7 +736,7 @@ st.markdown("""
     <h1>Riyadh Airport Analytics Dashboard</h1>
     <p>
         Interactive dashboard for analyzing Riyadh Airport departure traffic, airline activity,
-        destination demand, operational distribution, and short-term forecasting.
+        destination demand, terminal utilization, route balance, and short-term forecasting.
     </p>
     <div class="mini-note">Prepared by: Faisal Al-Sulami</div>
 </div>
@@ -657,9 +755,10 @@ dominant_route = mode_safe(filtered["route_type"]) if "route_type" in filtered.c
 hour_df = (
     filtered.groupby("hour")
     .size()
-    .reset_index(name="Number of Flights")
-    .sort_values("hour")
+    .reindex(range(24), fill_value=0)
+    .reset_index()
 )
+hour_df.columns = ["hour", "Number of Flights"]
 
 peak_hour = int(hour_df.loc[hour_df["Number of Flights"].idxmax(), "hour"]) if not hour_df.empty else None
 
@@ -735,8 +834,16 @@ daily_df = daily_series(filtered)
 # =========================================================
 # TABS
 # =========================================================
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-    ["Overview", "Traffic Patterns", "Destinations", "Forecasting", "Insights", "Data Overview"]
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+    [
+        "Overview",
+        "Traffic Patterns",
+        "Destinations & Airlines",
+        "Terminal & Routes",
+        "Forecasting",
+        "Insights",
+        "Data Overview"
+    ]
 )
 
 
@@ -744,7 +851,7 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
 # TAB 1 OVERVIEW
 # =========================================================
 with tab1:
-    left, right = st.columns([1.25, 0.75])
+    left, right = st.columns([1.2, 0.8])
 
     with left:
         st.markdown('<div class="section-head">Daily Flight Trend</div>', unsafe_allow_html=True)
@@ -766,7 +873,7 @@ with tab1:
         ))
 
         fig.update_layout(
-            height=420,
+            height=430,
             margin=dict(l=10, r=10, t=25, b=10),
             xaxis_title="Date",
             yaxis_title="Number of Flights",
@@ -777,20 +884,48 @@ with tab1:
         st.plotly_chart(fig, use_container_width=True)
 
     with right:
-        st.markdown('<div class="section-head">Executive Snapshot</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-head">Route Balance</div>', unsafe_allow_html=True)
 
-        avg_daily = daily_df["Number of Flights"].mean()
-        median_daily = daily_df["Number of Flights"].median()
+        route_counts = filtered["route_type"].value_counts()
+        if not route_counts.empty:
+            fig_route = go.Figure(data=[go.Pie(
+                labels=route_counts.index,
+                values=route_counts.values,
+                hole=0.55,
+                pull=[0.04] * len(route_counts),
+                textinfo="label+percent"
+            )])
 
-        st.markdown('<div class="glass">', unsafe_allow_html=True)
-        st.markdown(f"""
+            fig_route.update_layout(
+                height=430,
+                margin=dict(l=10, r=10, t=25, b=10),
+                annotations=[dict(
+                    text=f"Flights<br><b>{route_counts.sum():,}</b>",
+                    x=0.5, y=0.5, font_size=18, showarrow=False
+                )],
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)"
+            )
+            st.plotly_chart(fig_route, use_container_width=True)
+
+    st.markdown('<div class="section-head">Executive Snapshot</div>', unsafe_allow_html=True)
+
+    avg_daily = daily_df["Number of Flights"].mean()
+    median_daily = daily_df["Number of Flights"].median()
+
+    domestic_count = int((filtered["route_type"] == "Domestic").sum()) if "route_type" in filtered.columns else 0
+    international_count = int((filtered["route_type"] == "International").sum()) if "route_type" in filtered.columns else 0
+
+    st.markdown(f"""
+    <div class="glass">
         <div class="small-muted">
         The selected data shows an average of <b>{avg_daily:,.0f}</b> flights per day and a median of
-        <b>{median_daily:,.0f}</b>. This gives a concise view of daily traffic intensity and helps identify
-        whether operations are concentrated around a stable level or affected by fluctuations.
+        <b>{median_daily:,.0f}</b>. The route mix remains led by <b>{dominant_route}</b> traffic, with
+        <b>{domestic_count:,}</b> domestic departures and <b>{international_count:,}</b> international departures.
+        This helps position Riyadh Airport both as a strong domestic connector and a regional international hub.
         </div>
-        """, unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
+    </div>
+    """, unsafe_allow_html=True)
 
 
 # =========================================================
@@ -801,6 +936,7 @@ with tab2:
 
     with c1:
         st.markdown('<div class="section-head">Flights by Hour of Day</div>', unsafe_allow_html=True)
+
         fig_hour = px.area(
             hour_df,
             x="hour",
@@ -815,21 +951,21 @@ with tab2:
             paper_bgcolor="rgba(0,0,0,0)",
             plot_bgcolor="rgba(0,0,0,0)"
         )
+        fig_hour.update_xaxes(dtick=1)
         st.plotly_chart(fig_hour, use_container_width=True)
 
     with c2:
         st.markdown('<div class="section-head">Flights by Day of Week</div>', unsafe_allow_html=True)
 
         day_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-        dow_df = filtered.groupby("day_of_week").size().reset_index(name="Number of Flights")
-        dow_df["day_of_week"] = pd.Categorical(dow_df["day_of_week"], categories=day_order, ordered=True)
-        dow_df = dow_df.sort_values("day_of_week")
+        dow_df = filtered.groupby("day_of_week").size().reindex(day_order, fill_value=0).reset_index()
+        dow_df.columns = ["day_of_week", "Number of Flights"]
 
         fig_dow = px.bar(
             dow_df,
             x="day_of_week",
             y="Number of Flights",
-            text_auto=True
+            text="Number of Flights"
         )
         fig_dow.update_layout(
             height=380,
@@ -841,22 +977,72 @@ with tab2:
         )
         st.plotly_chart(fig_dow, use_container_width=True)
 
-    st.markdown('<div class="section-head">Flights by Month</div>', unsafe_allow_html=True)
+    b1, b2 = st.columns([1.1, 0.9])
 
-    month_df = (
+    with b1:
+        st.markdown('<div class="section-head">Day of Week vs Hour Heatmap</div>', unsafe_allow_html=True)
+
+        heatmap_data = (
+            filtered.groupby(["day_of_week", "hour"])
+            .size()
+            .reset_index(name="flights")
+            .pivot(index="day_of_week", columns="hour", values="flights")
+        )
+        heatmap_data = heatmap_data.reindex(index=day_order, columns=range(24), fill_value=0)
+
+        fig_heat = px.imshow(
+            heatmap_data,
+            aspect="auto",
+            labels=dict(x="Hour of Day", y="Day of Week", color="Flights"),
+            text_auto=False
+        )
+        fig_heat.update_layout(
+            height=420,
+            margin=dict(l=10, r=10, t=25, b=10),
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)"
+        )
+        st.plotly_chart(fig_heat, use_container_width=True)
+
+    with b2:
+        st.markdown('<div class="section-head">Flights by Month</div>', unsafe_allow_html=True)
+
+        month_order = [
+            "January", "February", "March", "April", "May", "June",
+            "July", "August", "September", "October", "November", "December"
+        ]
+        month_df = filtered.groupby("month_name").size().reindex(month_order).dropna().reset_index()
+        month_df.columns = ["month_name", "Number of Flights"]
+
+        fig_month_pie = go.Figure(data=[go.Pie(
+            labels=month_df["month_name"],
+            values=month_df["Number of Flights"],
+            textinfo="label+percent"
+        )])
+        fig_month_pie.update_layout(
+            height=420,
+            margin=dict(l=10, r=10, t=25, b=10),
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)"
+        )
+        st.plotly_chart(fig_month_pie, use_container_width=True)
+
+    st.markdown('<div class="section-head">Monthly Trend Line</div>', unsafe_allow_html=True)
+
+    month_num_df = (
         filtered.groupby(["month", "month_name"])
         .size()
         .reset_index(name="Number of Flights")
         .sort_values("month")
     )
 
-    fig_month = px.line(
-        month_df,
+    fig_month_line = px.line(
+        month_num_df,
         x="month_name",
         y="Number of Flights",
         markers=True
     )
-    fig_month.update_layout(
+    fig_month_line.update_layout(
         height=390,
         margin=dict(l=10, r=10, t=25, b=10),
         xaxis_title="Month",
@@ -864,86 +1050,105 @@ with tab2:
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)"
     )
-    st.plotly_chart(fig_month, use_container_width=True)
+    st.plotly_chart(fig_month_line, use_container_width=True)
 
 
 # =========================================================
-# TAB 3 DESTINATIONS
+# TAB 3 DESTINATIONS & AIRLINES
 # =========================================================
 with tab3:
     d1, d2 = st.columns(2)
 
-    if "destination_airport_name" in filtered.columns and "route_type" in filtered.columns:
-        top_international = (
-            filtered[filtered["route_type"] == "International"]["destination_airport_name"]
-            .dropna()
-            .value_counts()
-            .head(10)
-            .reset_index()
-        )
+    top_international = (
+        filtered[filtered["route_type"] == "International"]["destination_airport_name"]
+        .dropna()
+        .value_counts()
+        .head(10)
+        .reset_index()
+    )
+    top_international.columns = ["Destination Airport", "Number of Flights"]
 
+    top_domestic = (
+        filtered[filtered["route_type"] == "Domestic"]["destination_airport_name"]
+        .dropna()
+        .value_counts()
+        .head(10)
+        .reset_index()
+    )
+    top_domestic.columns = ["Destination Airport", "Number of Flights"]
+
+    with d1:
+        st.markdown('<div class="section-head">Top 10 International Destinations from Riyadh</div>', unsafe_allow_html=True)
         if not top_international.empty:
-            top_international.columns = ["Destination Airport", "Number of Flights"]
-
-            with d1:
-                st.markdown('<div class="section-head">Top 10 International Destinations from Riyadh</div>', unsafe_allow_html=True)
-                fig_int = px.bar(
-                    top_international,
-                    x="Destination Airport",
-                    y="Number of Flights",
-                    text="Number of Flights"
-                )
-                fig_int.update_layout(
-                    height=430,
-                    margin=dict(l=10, r=10, t=25, b=10),
-                    xaxis_title="International Destination Airport",
-                    yaxis_title="Number of Flights",
-                    paper_bgcolor="rgba(0,0,0,0)",
-                    plot_bgcolor="rgba(0,0,0,0)"
-                )
-                fig_int.update_traces(textposition="outside")
-                st.plotly_chart(fig_int, use_container_width=True)
+            fig_int = px.bar(
+                top_international,
+                x="Destination Airport",
+                y="Number of Flights",
+                text="Number of Flights"
+            )
+            fig_int.update_layout(
+                height=430,
+                margin=dict(l=10, r=10, t=25, b=10),
+                xaxis_title="International Destination Airport",
+                yaxis_title="Number of Flights",
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)"
+            )
+            fig_int.update_traces(textposition="outside")
+            st.plotly_chart(fig_int, use_container_width=True)
         else:
-            with d1:
-                st.markdown('<div class="section-head">Top 10 International Destinations from Riyadh</div>', unsafe_allow_html=True)
-                st.info("No international destination data is available for the selected filters.")
+            st.info("No international destination data is available for the selected filters.")
 
-        top_domestic = (
-            filtered[filtered["route_type"] == "Domestic"]["destination_airport_name"]
-            .dropna()
-            .value_counts()
-            .head(10)
-            .reset_index()
-        )
-
+    with d2:
+        st.markdown('<div class="section-head">Top 10 Domestic Destinations from Riyadh</div>', unsafe_allow_html=True)
         if not top_domestic.empty:
-            top_domestic.columns = ["Destination Airport", "Number of Flights"]
-
-            with d2:
-                st.markdown('<div class="section-head">Top 10 Domestic Destinations from Riyadh</div>', unsafe_allow_html=True)
-                fig_dom = px.bar(
-                    top_domestic,
-                    x="Destination Airport",
-                    y="Number of Flights",
-                    text="Number of Flights"
-                )
-                fig_dom.update_layout(
-                    height=430,
-                    margin=dict(l=10, r=10, t=25, b=10),
-                    xaxis_title="Domestic Destination Airport",
-                    yaxis_title="Number of Flights",
-                    paper_bgcolor="rgba(0,0,0,0)",
-                    plot_bgcolor="rgba(0,0,0,0)"
-                )
-                fig_dom.update_traces(textposition="outside")
-                st.plotly_chart(fig_dom, use_container_width=True)
+            fig_dom = px.bar(
+                top_domestic,
+                x="Destination Airport",
+                y="Number of Flights",
+                text="Number of Flights"
+            )
+            fig_dom.update_layout(
+                height=430,
+                margin=dict(l=10, r=10, t=25, b=10),
+                xaxis_title="Domestic Destination Airport",
+                yaxis_title="Number of Flights",
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)"
+            )
+            fig_dom.update_traces(textposition="outside")
+            st.plotly_chart(fig_dom, use_container_width=True)
         else:
-            with d2:
-                st.markdown('<div class="section-head">Top 10 Domestic Destinations from Riyadh</div>', unsafe_allow_html=True)
-                st.info("No domestic destination data is available for the selected filters.")
+            st.info("No domestic destination data is available for the selected filters.")
+
+    st.markdown('<div class="section-head">Top Destination Airports Overall</div>', unsafe_allow_html=True)
+
+    top_dest = (
+        filtered["destination_airport_name"]
+        .value_counts()
+        .head(10)
+        .reset_index()
+    )
+    top_dest.columns = ["Destination Airport", "Number of Flights"]
+
+    fig_dest = px.bar(
+        top_dest,
+        x="Destination Airport",
+        y="Number of Flights",
+        text="Number of Flights"
+    )
+    fig_dest.update_layout(
+        height=420,
+        margin=dict(l=10, r=10, t=25, b=10),
+        xaxis_title="Destination Airport",
+        yaxis_title="Number of Flights",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)"
+    )
+    fig_dest.update_traces(textposition="outside")
+    st.plotly_chart(fig_dest, use_container_width=True)
 
     st.markdown('<div class="section-head">Geographic Destination Heatmap</div>', unsafe_allow_html=True)
-
     map_df = build_destination_map_data(filtered)
 
     if not map_df.empty:
@@ -966,69 +1171,75 @@ with tab3:
             mapbox_style="carto-darkmatter"
         )
 
-        fig_map.update_traces(
-            marker=dict(opacity=0.82)
-        )
-
+        fig_map.update_traces(marker=dict(opacity=0.82))
         fig_map.update_layout(
             margin=dict(l=10, r=10, t=20, b=10),
             paper_bgcolor="rgba(0,0,0,0)",
             plot_bgcolor="rgba(0,0,0,0)",
             legend_title_text="Location Type"
         )
-
         st.plotly_chart(fig_map, use_container_width=True)
 
-        st.markdown("""
-        <div class="glass">
-        This geographic view highlights Riyadh as the central origin point and displays destination airports
-        according to their flight volume. Larger circles indicate higher traffic concentration, helping users
-        quickly identify the strongest regional and international connections.
-        </div>
-        """, unsafe_allow_html=True)
-    else:
-        st.info("No mapped destination coordinates are currently available for the selected filters.")
+    st.markdown('<div class="section-head">Pareto Analysis of Airlines</div>', unsafe_allow_html=True)
 
-    st.markdown('<div class="section-head">Top Airlines by Number of Flights</div>', unsafe_allow_html=True)
+    airline_df = (
+        filtered["airline.name"]
+        .value_counts()
+        .head(10)
+        .reset_index()
+    )
+    airline_df.columns = ["Airline Name", "Number of Flights"]
+    airline_df["Cumulative %"] = airline_df["Number of Flights"].cumsum() / airline_df["Number of Flights"].sum() * 100
 
-    if "airline.name" in filtered.columns:
-        airline_df = (
-            filtered.groupby("airline.name")
-            .size()
-            .reset_index(name="Number of Flights")
-            .sort_values("Number of Flights", ascending=False)
-            .head(top_n)
-        )
-        airline_df = airline_df.rename(columns={"airline.name": "Airline Name"})
+    fig_pareto = go.Figure()
+    fig_pareto.add_trace(go.Bar(
+        x=airline_df["Airline Name"],
+        y=airline_df["Number of Flights"],
+        name="Number of Flights"
+    ))
+    fig_pareto.add_trace(go.Scatter(
+        x=airline_df["Airline Name"],
+        y=airline_df["Cumulative %"],
+        mode="lines+markers+text",
+        text=[f"{v:.1f}%" for v in airline_df["Cumulative %"]],
+        textposition="top center",
+        name="Cumulative %",
+        yaxis="y2"
+    ))
 
-        fig_air = px.bar(
-            airline_df,
-            x="Airline Name",
-            y="Number of Flights",
-            text="Number of Flights"
-        )
-        fig_air.update_layout(
-            height=430,
-            margin=dict(l=10, r=10, t=25, b=10),
-            xaxis_title="Airline",
-            yaxis_title="Number of Flights",
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)"
-        )
-        fig_air.update_traces(textposition="outside")
-        st.plotly_chart(fig_air, use_container_width=True)
+    fig_pareto.update_layout(
+        height=460,
+        margin=dict(l=10, r=10, t=25, b=10),
+        xaxis_title="Airline",
+        yaxis=dict(title="Number of Flights"),
+        yaxis2=dict(
+            title="Cumulative Percentage (%)",
+            overlaying="y",
+            side="right",
+            range=[0, 105]
+        ),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)"
+    )
+    st.plotly_chart(fig_pareto, use_container_width=True)
 
-    if "movement.terminal" in filtered.columns:
+
+# =========================================================
+# TAB 4 TERMINAL & ROUTES
+# =========================================================
+with tab4:
+    c1, c2 = st.columns(2)
+
+    with c1:
         st.markdown('<div class="section-head">Flight Distribution by Terminal</div>', unsafe_allow_html=True)
 
         terminal_df = (
             filtered.groupby("movement.terminal")
             .size()
             .reset_index(name="Number of Flights")
-            .sort_values("Number of Flights", ascending=False)
+            .sort_values("movement.terminal")
         )
-
-        terminal_df = terminal_df.rename(columns={"movement.terminal": "Terminal"})
+        terminal_df["Terminal"] = terminal_df["movement.terminal"].apply(lambda x: f"Terminal {int(float(x))}")
 
         fig_terminal = px.bar(
             terminal_df,
@@ -1036,7 +1247,6 @@ with tab3:
             y="Number of Flights",
             text="Number of Flights"
         )
-
         fig_terminal.update_layout(
             height=420,
             margin=dict(l=10, r=10, t=25, b=10),
@@ -1045,15 +1255,59 @@ with tab3:
             paper_bgcolor="rgba(0,0,0,0)",
             plot_bgcolor="rgba(0,0,0,0)"
         )
-
         fig_terminal.update_traces(textposition="outside")
         st.plotly_chart(fig_terminal, use_container_width=True)
 
+    with c2:
+        st.markdown('<div class="section-head">Domestic vs International by Terminal</div>', unsafe_allow_html=True)
+
+        term_route_df = (
+            filtered.groupby(["movement.terminal", "route_type"])
+            .size()
+            .reset_index(name="Number of Flights")
+            .sort_values("movement.terminal")
+        )
+        term_route_df["Terminal"] = term_route_df["movement.terminal"].apply(lambda x: f"Terminal {int(float(x))}")
+
+        fig_term_route = px.bar(
+            term_route_df,
+            x="Terminal",
+            y="Number of Flights",
+            color="route_type",
+            barmode="stack"
+        )
+        fig_term_route.update_layout(
+            height=420,
+            margin=dict(l=10, r=10, t=25, b=10),
+            xaxis_title="Terminal",
+            yaxis_title="Number of Flights",
+            legend_title="Route Type",
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)"
+        )
+        st.plotly_chart(fig_term_route, use_container_width=True)
+
+    st.markdown('<div class="section-head">Route Share Summary</div>', unsafe_allow_html=True)
+
+    route_counts = filtered["route_type"].value_counts().reset_index()
+    route_counts.columns = ["Route Type", "Number of Flights"]
+    route_counts["Share %"] = route_counts["Number of Flights"] / route_counts["Number of Flights"].sum() * 100
+
+    st.dataframe(route_counts, use_container_width=True, hide_index=True)
+
+    st.markdown("""
+    <div class="glass">
+    This section highlights how traffic is distributed across airport terminals and how each terminal contributes
+    to domestic and international operations. It supports operational decisions related to gate allocation,
+    terminal balancing, and congestion reduction.
+    </div>
+    """, unsafe_allow_html=True)
+
 
 # =========================================================
-# TAB 4 FORECASTING
+# TAB 5 FORECASTING
 # =========================================================
-with tab4:
+with tab5:
     st.markdown('<div class="section-head">Short-Term Forecasting</div>', unsafe_allow_html=True)
 
     fc = run_forecasting(daily_df)
@@ -1064,38 +1318,35 @@ with tab4:
         f1, f2 = st.columns([1.15, 0.85])
 
         with f1:
+            st.markdown("#### Train/Test Split with Predictions")
+
             fig_split = go.Figure()
             fig_split.add_trace(go.Scatter(
                 x=fc["train"]["date"],
-                y=fc["train"]["Number of Flights"],
+                y=fc["train"]["flights"],
                 mode="lines",
                 name="Training Data"
             ))
             fig_split.add_trace(go.Scatter(
                 x=fc["test"]["date"],
-                y=fc["test"]["Number of Flights"],
+                y=fc["test"]["flights"],
                 mode="lines",
-                name="Actual Test Data"
-            ))
-            fig_split.add_trace(go.Scatter(
-                x=fc["test"]["date"],
-                y=fc["test"]["Linear Regression Prediction"],
-                mode="lines",
-                name="Linear Regression Prediction",
-                line=dict(dash="dash")
+                name="Actual Test Data",
+                line=dict(width=3)
             ))
 
-            if fc["test"]["SARIMAX Prediction"].notna().sum() > 0:
-                fig_split.add_trace(go.Scatter(
-                    x=fc["test"]["date"],
-                    y=fc["test"]["SARIMAX Prediction"],
-                    mode="lines",
-                    name="SARIMAX Prediction",
-                    line=dict(dash="dash")
-                ))
+            for model_name in ["Linear Regression", "ARIMA", "Prophet"]:
+                if model_name in fc["test"].columns and fc["test"][model_name].notna().sum() > 0:
+                    fig_split.add_trace(go.Scatter(
+                        x=fc["test"]["date"],
+                        y=fc["test"][model_name],
+                        mode="lines",
+                        name=model_name,
+                        line=dict(dash="dash")
+                    ))
 
             fig_split.update_layout(
-                height=420,
+                height=430,
                 margin=dict(l=10, r=10, t=25, b=10),
                 xaxis_title="Date",
                 yaxis_title="Number of Flights",
@@ -1122,7 +1373,7 @@ with tab4:
                 ))
                 fig_err.update_layout(
                     barmode="group",
-                    height=330,
+                    height=340,
                     margin=dict(l=10, r=10, t=15, b=10),
                     xaxis_title="Forecasting Model",
                     yaxis_title="Error Value",
@@ -1131,48 +1382,117 @@ with tab4:
                 )
                 st.plotly_chart(fig_err, use_container_width=True)
 
-        st.markdown("#### Next 14-Day Forecast")
-        fig_future = go.Figure()
+        c3, c4 = st.columns(2)
 
+        with c3:
+            st.markdown("#### RMSE Comparison")
+            fig_rmse = px.bar(
+                fc["results"],
+                x="Model",
+                y="RMSE",
+                text="RMSE"
+            )
+            fig_rmse.update_traces(texttemplate="%{text:.2f}", textposition="outside")
+            fig_rmse.update_layout(
+                height=360,
+                margin=dict(l=10, r=10, t=20, b=10),
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)"
+            )
+            st.plotly_chart(fig_rmse, use_container_width=True)
+
+        with c4:
+            st.markdown("#### MAE Comparison")
+            fig_mae = px.bar(
+                fc["results"],
+                x="Model",
+                y="MAE",
+                text="MAE"
+            )
+            fig_mae.update_traces(texttemplate="%{text:.2f}", textposition="outside")
+            fig_mae.update_layout(
+                height=360,
+                margin=dict(l=10, r=10, t=20, b=10),
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)"
+            )
+            st.plotly_chart(fig_mae, use_container_width=True)
+
+        st.markdown("#### Next 14-Day Forecast")
+
+        fig_future = go.Figure()
         fig_future.add_trace(go.Scatter(
             x=fc["ts"]["date"],
-            y=fc["ts"]["Number of Flights"],
+            y=fc["ts"]["flights"],
             mode="lines",
             name="Historical Flights",
             line=dict(width=3)
         ))
-        fig_future.add_trace(go.Scatter(
-            x=fc["future"]["Forecast Date"],
-            y=fc["future"]["Linear Regression Forecast"],
-            mode="lines+markers",
-            name="Linear Regression Forecast",
-            line=dict(dash="dash")
-        ))
 
-        if fc["future"]["SARIMAX Forecast"].notna().sum() > 0:
-            fig_future.add_trace(go.Scatter(
-                x=fc["future"]["Forecast Date"],
-                y=fc["future"]["SARIMAX Forecast"],
-                mode="lines+markers",
-                name="SARIMAX Forecast",
-                line=dict(dash="dash")
-            ))
+        for model_name in ["Linear Regression", "ARIMA", "Prophet"]:
+            if model_name in fc["future"].columns and fc["future"][model_name].notna().sum() > 0:
+                fig_future.add_trace(go.Scatter(
+                    x=fc["future"]["Forecast Date"],
+                    y=fc["future"][model_name],
+                    mode="lines+markers",
+                    name=f"{model_name} Forecast",
+                    line=dict(dash="dash")
+                ))
 
         fig_future.update_layout(
             height=430,
             margin=dict(l=10, r=10, t=25, b=10),
             xaxis_title="Forecast Date",
-            yaxis_title="Number of Flights",
+            yaxis_title="Predicted Number of Flights",
             paper_bgcolor="rgba(0,0,0,0)",
             plot_bgcolor="rgba(0,0,0,0)"
         )
         st.plotly_chart(fig_future, use_container_width=True)
 
+        st.markdown("#### Actual vs Predicted Scatter Plots")
+
+        model_cols = [m for m in ["Linear Regression", "ARIMA", "Prophet"] if m in fc["test"].columns and fc["test"][m].notna().sum() > 0]
+        if model_cols:
+            scatter_cols = st.columns(len(model_cols))
+            for idx, model_name in enumerate(model_cols):
+                with scatter_cols[idx]:
+                    scatter_df = pd.DataFrame({
+                        "Actual Flights": fc["test"]["flights"],
+                        "Predicted Flights": fc["test"][model_name]
+                    })
+
+                    fig_scatter = px.scatter(
+                        scatter_df,
+                        x="Actual Flights",
+                        y="Predicted Flights",
+                        trendline=None
+                    )
+
+                    min_val = min(scatter_df["Actual Flights"].min(), scatter_df["Predicted Flights"].min())
+                    max_val = max(scatter_df["Actual Flights"].max(), scatter_df["Predicted Flights"].max())
+
+                    fig_scatter.add_trace(go.Scatter(
+                        x=[min_val, max_val],
+                        y=[min_val, max_val],
+                        mode="lines",
+                        name="Perfect Prediction"
+                    ))
+
+                    fig_scatter.update_layout(
+                        title=model_name,
+                        height=340,
+                        margin=dict(l=10, r=10, t=40, b=10),
+                        paper_bgcolor="rgba(0,0,0,0)",
+                        plot_bgcolor="rgba(0,0,0,0)",
+                        showlegend=False
+                    )
+                    st.plotly_chart(fig_scatter, use_container_width=True)
+
 
 # =========================================================
-# TAB 5 INSIGHTS
+# TAB 6 INSIGHTS
 # =========================================================
-with tab5:
+with tab6:
     st.markdown('<div class="section-head">Automated Insight Summary</div>', unsafe_allow_html=True)
 
     if "destination_airport_name" in filtered.columns and filtered["destination_airport_name"].notna().sum() > 0:
@@ -1206,6 +1526,13 @@ with tab5:
             f"<b>{peak_day_df.index[0]}</b> has the highest departure activity among all weekdays in the current selection."
         )
 
+    peak_hour_value = hour_df.loc[hour_df["Number of Flights"].idxmax(), "hour"]
+    peak_hour_count = hour_df["Number of Flights"].max()
+    insight_box(
+        "Peak Hour Pattern",
+        f"The busiest operational hour is <b>{int(peak_hour_value)}:00</b>, with <b>{int(peak_hour_count):,}</b> departures in the current filtered dataset."
+    )
+
     month_df = (
         filtered.groupby(["month", "month_name"])
         .size()
@@ -1238,20 +1565,26 @@ with tab5:
     <div class="glass">
     The exploratory analysis revealed several important operational patterns:
     <br><br>
-    <b>• Stable flight activity:</b><br>
-    Daily flight counts fluctuate, but overall they remain within a relatively consistent range, indicating stable airport operations.
+    <b>• Route balance:</b><br>
+    Riyadh Airport supports both domestic and international traffic, showing its dual role as a national connector and a regional gateway.
     <br><br>
-    <b>• Regional connectivity dominance:</b><br>
-    Many international routes connect Riyadh with nearby regional hubs such as <b>Dubai, Cairo, and Istanbul</b>, highlighting the strong importance of regional travel demand.
+    <b>• Domestic dominance on key routes:</b><br>
+    The Riyadh–Jeddah route remains one of the strongest domestic corridors, reflecting sustained demand between two major Saudi cities.
     <br><br>
-    <b>• Airline activity concentration:</b><br>
-    A small number of airlines account for a large share of departures, which is typical for major hub airports where traffic is concentrated among key carriers.
+    <b>• Regional connectivity:</b><br>
+    International traffic is strongly concentrated in nearby regional hubs such as <b>Dubai, Cairo, and Istanbul</b>, highlighting Riyadh’s role in regional mobility.
+    <br><br>
+    <b>• Airline concentration:</b><br>
+    A relatively small number of airlines account for a large portion of departures, indicating an operational structure dominated by major carriers.
     <br><br>
     <b>• Terminal utilization imbalance:</b><br>
-    The analysis showed that <b>Terminal 5 handled the largest share of flights</b>, mainly because it served a substantial portion of domestic routes. This created higher operational pressure compared with other terminals.
+    The analysis showed that <b>Terminal 5 handled the largest share of flights</b>, mainly because it served a substantial portion of domestic routes.
     <br><br>
-    <b>• Major operational adjustment:</b><br>
-    A notable operational change occurred on <b>February 25, 2026</b>, when domestic flights were redistributed to <b>Terminals 3 and 4</b> at Riyadh Airport. This real-world adjustment illustrates how airport data analysis can support <b>data-driven operational decisions</b> that improve passenger flow and reduce congestion.
+    <b>• Peak operations by time:</b><br>
+    Flight demand intensifies during certain hours of the day, especially evening activity, which suggests that staffing and gate planning should align with peak windows.
+    <br><br>
+    <b>• Operational adjustment:</b><br>
+    A notable operational change occurred on <b>February 25, 2026</b>, when domestic flights were redistributed to <b>Terminals 3 and 4</b>. This reflects how airport analytics can support better terminal balancing and congestion reduction.
     </div>
     """, unsafe_allow_html=True)
 
@@ -1267,17 +1600,17 @@ with tab5:
     st.markdown('<div class="section-head">Manager Takeaway</div>', unsafe_allow_html=True)
     st.markdown("""
     <div class="glass">
-    This dashboard converts Riyadh Airport departure data into an interactive decision-support tool.
-    It supports understanding demand patterns, identifying major routes and airlines, monitoring terminal usage,
-    and reviewing short-term flight forecasting in a professional and portfolio-ready format.
+    This dashboard transforms Riyadh Airport departure data into a professional decision-support tool.
+    It helps decision-makers understand route demand, airline concentration, terminal usage,
+    operating peaks, and short-term traffic expectations in one interactive environment.
     </div>
     """, unsafe_allow_html=True)
 
 
 # =========================================================
-# TAB 6 DATA OVERVIEW
+# TAB 7 DATA OVERVIEW
 # =========================================================
-with tab6:
+with tab7:
     st.markdown('<div class="section-head">Processed Dataset Overview</div>', unsafe_allow_html=True)
 
     st.markdown("""
@@ -1303,6 +1636,58 @@ with tab6:
         kpi_card("Columns", fmt_num(df.shape[1]), "Available fields")
     with d3:
         kpi_card("Missing Values", fmt_num(df.isna().sum().sum()), "Across processed dataset")
+
+    st.markdown('<div class="section-head">Initial Data Quality Report</div>', unsafe_allow_html=True)
+    q1, q2 = st.columns([0.9, 1.1])
+
+    with q1:
+        quality_table = pd.DataFrame({
+            "Metric": [
+                "Raw Rows",
+                "Raw Columns",
+                "Processed Rows",
+                "Processed Columns",
+                "Columns > 50% Missing"
+            ],
+            "Value": [
+                quality_summary["raw_rows"],
+                quality_summary["raw_cols"],
+                quality_summary["processed_rows"],
+                quality_summary["processed_cols"],
+                len(quality_summary["columns_over_50_missing"])
+            ]
+        })
+        st.dataframe(quality_table, use_container_width=True, hide_index=True)
+
+    with q2:
+        st.markdown("##### Columns with More Than 50% Missing")
+        if quality_summary["columns_over_50_missing"]:
+            st.write(", ".join(quality_summary["columns_over_50_missing"]))
+        else:
+            st.write("No columns exceed 50% missingness.")
+
+        st.markdown("##### Datetime-like Columns")
+        st.write(", ".join(quality_summary["datetime_like_columns"]) if quality_summary["datetime_like_columns"] else "None")
+
+    st.markdown('<div class="section-head">Missing Value Percentage by Column</div>', unsafe_allow_html=True)
+    miss_top = missing_percentage_df.head(15)
+
+    fig_missing = px.bar(
+        miss_top,
+        x="Column",
+        y="Missing %",
+        text="Missing %"
+    )
+    fig_missing.update_traces(texttemplate="%{text:.2f}", textposition="outside")
+    fig_missing.update_layout(
+        height=420,
+        margin=dict(l=10, r=10, t=25, b=10),
+        xaxis_title="Column",
+        yaxis_title="Missing Percentage",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)"
+    )
+    st.plotly_chart(fig_missing, use_container_width=True)
 
     st.markdown('<div class="section-head">Processed Data Table</div>', unsafe_allow_html=True)
     rows_to_show = st.slider(
